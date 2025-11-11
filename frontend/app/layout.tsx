@@ -16,7 +16,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body>
+      <body className="max-w-7xl mx-auto">
         <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
           <NavigationBar />
           {children}
