@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import NavigationBar from "./components/navigation";
 import { ThemeProvider } from "next-themes";
 
 
@@ -16,9 +15,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body className="max-w-7xl mx-auto">
+      <body className="">
         <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
-          <NavigationBar />
+          
           {children}
         </ThemeProvider>
       </body>
