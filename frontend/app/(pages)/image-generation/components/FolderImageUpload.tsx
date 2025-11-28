@@ -1,14 +1,18 @@
 "use client";
 
 import { useState } from "react";
+import { useImageGen } from "../ImageGenContext";
 import Image from "next/image";
 
 export default function FolderImageUpload() {
-  const [images, setImages] = useState<string[]>([]);
+  const { images: ctxImages, setImages: setCtxImages } = useImageGen();
   const [folderPath, setFolderPath] = useState<string | null>(null);
 
+  // Local previews (limited to first N) — derived from context.images for display
+  const images = ctxImages.slice(0, 20).map((i) => i.preview ?? "");
+
   const handleFolder = (files: FileList) => {
-    const arr: string[] = [];
+    const arr = [] as { file: File; relativePath?: string; preview?: string }[];
     let baseFolder = "";
 
     Array.from(files).forEach((file, index) => {
@@ -19,12 +23,13 @@ export default function FolderImageUpload() {
 
       if (file.type.startsWith("image/")) {
         const url = URL.createObjectURL(file);
-        arr.push(url);
+        const wp = (file as unknown as { webkitRelativePath?: string }).webkitRelativePath;
+        arr.push({ file, relativePath: wp, preview: url });
       }
     });
 
-    // Limit: show first few images only
-    setImages(arr.slice(0, 20));
+    // store all images into context (we will limit previews in UI)
+    setCtxImages(arr);
   };
 
   return (

@@ -2,10 +2,14 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useImageGen } from "../ImageGenContext";
 import { FolderOpen } from "lucide-react";
 
 export default function OutputDirectorySelector() {
-  const [outputDir, setOutputDir] = useState<string>(() => {
+  const { outputDir, setOutputDir } = useImageGen();
+
+  // Keep a local 'display' default but the context holds the real source of truth
+  const [localDir] = useState<string>(() => {
     // Generate default directory = outputs/YYYY-MM-DD/
     const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
     return `/outputs/${today}/`;
@@ -47,7 +51,7 @@ export default function OutputDirectorySelector() {
 
       <p className="text-sm text-muted-foreground break-all">
         <span className="font-medium text-foreground">Selected:</span>{" "}
-        {outputDir}
+        {outputDir ?? localDir}
       </p>
     </div>
   );

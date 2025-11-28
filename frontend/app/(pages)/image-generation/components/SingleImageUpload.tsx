@@ -1,12 +1,14 @@
 "use client";
 
 import { useState } from "react";
+import { useImageGen } from "../ImageGenContext";
 import Image from "next/image";
 import { X, Loader2 } from "lucide-react";
 
 export default function SingleImageUpload() {
-  const [preview, setPreview] = useState<string | null>(null);
-  const [fileName, setFileName] = useState<string | null>(null);
+  const { singleImage, setSingleImage } = useImageGen();
+  const [preview, setPreview] = useState<string | null>(singleImage?.preview ?? null);
+  const [fileName, setFileName] = useState<string | null>(singleImage?.file.name ?? null);
   const [loading, setLoading] = useState(false);
 
   const handleFile = (file: File) => {
@@ -15,7 +17,10 @@ export default function SingleImageUpload() {
 
     const reader = new FileReader();
     reader.onload = () => {
-      setPreview(reader.result as string);
+      // set local preview and push to global state
+      const previewStr = reader.result as string;
+      setPreview(previewStr);
+      setSingleImage({ file, preview: previewStr });
       setLoading(false);
     };
     reader.readAsDataURL(file);
@@ -34,6 +39,7 @@ export default function SingleImageUpload() {
               e.stopPropagation();
               setPreview(null);
               setFileName(null);
+              setSingleImage(null);
             }}
             className="absolute top-2 right-2 bg-black/50 hover:bg-black/70 p-1 rounded-full"
           >
