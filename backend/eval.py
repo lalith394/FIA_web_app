@@ -331,25 +331,112 @@ def infer_images(model_name, image_paths, threshold: float = 0.5, out_dir: str |
     model_dir = f"models/segmentation/{model_name}"
     model_path = f"{model_dir}/{model_name}.pth"
 
-    # Try to read model-specific num_channels from metadata if available
-    try:
-        import json
-        meta_path = os.path.join(model_dir, "metadata.json")
-        if os.path.exists(meta_path):
-            with open(meta_path, 'r', encoding='utf8') as f:
+    # Load metadata dynamically by searching models/<type>/<model>/metadata.json or models/<model>/metadata.json
+    import json
+    models_root = os.path.join(os.getcwd(), 'models')
+
+    meta = None
+    model_type = None
+    model_dir = None
+
+    # search under models/<type>/<model_name>
+    if os.path.isdir(models_root):
+        for t in os.listdir(models_root):
+            candidate = os.path.join(models_root, t, model_name)
+            if os.path.isdir(candidate):
+                candidate_meta = os.path.join(candidate, 'metadata.json')
+                if os.path.exists(candidate_meta):
+                    with open(candidate_meta, 'r', encoding='utf8') as f:
+                        meta = json.load(f)
+                        model_dir = candidate
+                        model_type = meta.get('type') or t
+                        break
+
+    # fallback: try models/<model_name>/metadata.json
+    if meta is None:
+        candidate = os.path.join(models_root, model_name)
+        meta_path_fallback = os.path.join(candidate, 'metadata.json')
+        if os.path.exists(meta_path_fallback):
+            with open(meta_path_fallback, 'r', encoding='utf8') as f:
                 meta = json.load(f)
-                num_channels = meta.get('parameters', {}).get('num_channels', {}).get('default', None)
-                if num_channels is None:
-                    num_channels = [64, 128, 256, 512, 1024, 512, 256, 128, 64]
+                model_dir = candidate
+                model_type = meta.get('type')
+
+    # final fallback: assume segmentation & folder under models/segmentation/<model_name>
+    if meta is None:
+        seg_candidate = os.path.join(models_root, 'segmentation', model_name)
+        if os.path.isdir(seg_candidate):
+            model_dir = seg_candidate
+            meta_path = os.path.join(seg_candidate, 'metadata.json')
+            if os.path.exists(meta_path):
+                with open(meta_path, 'r', encoding='utf8') as f:
+                    meta = json.load(f)
+                    model_type = meta.get('type', 'segmentation')
+            else:
+                model_type = 'segmentation'
+
+    # If still no metadata found raise error
+    if meta is None:
+        raise FileNotFoundError(f"No metadata found for model '{model_name}' under {models_root}")
+
+    # parse parameters
+    params = meta.get('parameters', {}) if isinstance(meta, dict) else {}
+    # num_channels: may be nested under parameters.num_channels.default OR a top-level list
+    num_channels = None
+    if 'num_channels' in params:
+        val = params.get('num_channels')
+        if isinstance(val, dict):
+            num_channels = val.get('default')
         else:
-            num_channels = [64, 128, 256, 512, 1024, 512, 256, 128, 64]
-    except Exception:
+            num_channels = val
+    elif meta.get('num_channels'):
+        num_channels = meta.get('num_channels')
+
+    if not num_channels:
+        # default UNet layout
         num_channels = [64, 128, 256, 512, 1024, 512, 256, 128, 64]
 
-    # Load model
-    model = UNet(num_channels=[64, 128, 256, 512, 1024, 512, 256, 128, 64]).to(device)
+    # resolution: accept parameters.resolution.default or parameters.image_resolution or top-level resolution
+    res = None
+    if 'resolution' in params:
+        r = params.get('resolution')
+        if isinstance(r, dict):
+            res = r.get('default')
+        else:
+            res = r
+    if not res and meta.get('resolution'):
+        res = meta.get('resolution')
+
+    # default segmentation res is [384, 576] (height, width)
+    if model_type == 'segmentation' and (not res or len(res) != 2):
+        res = [384, 576]
+
+    # validate res
+    if res and (not isinstance(res, (list, tuple)) or len(res) != 2):
+        res = None
+
+    # Resolve model_path inside the discovered model_dir
+    if model_dir is None:
+        raise FileNotFoundError(f"Model directory not found for model '{model_name}'")
+    
+    model_path = os.path.join(model_dir, f"{model_name}.pth")
     if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
+        # fallback: pick any .pth in the model_dir
+        pths = [f for f in os.listdir(model_dir) if f.endswith('.pth')]
+        if pths:
+            model_path = os.path.join(model_dir, pths[0])
+        else:
+            raise FileNotFoundError(f"Model file not found in: {model_dir}")
+
+    # Instantiate model according to type
+    if model_type == 'segmentation':
+        model = UNet(num_channels=num_channels).to(device)
+    elif model_type == 'autoencoder':
+        model = AutoEncoder(num_channels=num_channels).to(device)
+    else:
+        # Unknown type: default to UNet for now, but warn
+        print(f"[warn] unknown model type '{model_type}', defaulting to UNet")
+        model = UNet(num_channels=num_channels).to(device)
 
     checkpoint = torch.load(model_path, map_location=device)
     state = checkpoint.get('model_state_dict', checkpoint)
@@ -357,8 +444,14 @@ def infer_images(model_name, image_paths, threshold: float = 0.5, out_dir: str |
     model.eval()
 
     # Compose PIL-based transform to ensure tensors are floats in [0,1]
+    if res and isinstance(res, (list, tuple)) and len(res) == 2:
+        h, w = int(res[0]), int(res[1])
+    else:
+        # default
+        h, w = 384, 576
+
     pil_transform = T.Compose([
-        T.Resize((384, 576)),
+        T.Resize((h, w)),
         T.ToTensor(),
     ])
 
@@ -403,14 +496,14 @@ def infer_images(model_name, image_paths, threshold: float = 0.5, out_dir: str |
                 print(f"infer_images: model outputs shape = {tuple(outputs.shape)} (B,1,H,W) - d4_feats shape = {tuple(d4_feats.shape) if d4_feats is not None else 'None'}")
             except Exception:
                 pass
-            outputs = torch.sigmoid(outputs)
-            # outputs shape [B, 1, H, W] — threshold and save per sample
+            # For segmentation models ensure probabilities are in [0,1]
+            if model_type == 'segmentation':
+                outputs = torch.sigmoid(outputs)
+            # outputs now shape could be [B,1,H,W] for segmentation or [B,C,H,W] for recon
             for i in range(outputs.shape[0]):
                 out_single = outputs[i]
                 print(out_single)
                 
-                # Apply threshold argument to binarize prediction
-                mask = (out_single).squeeze().cpu().numpy()  # shape [1,H,W]
                 img_path = valid_paths[i]
 
                 base_name = os.path.splitext(os.path.basename(img_path))[0]
@@ -425,11 +518,36 @@ def infer_images(model_name, image_paths, threshold: float = 0.5, out_dir: str |
                 else:
                     mask_save_path = os.path.join(results_dir, f"{base_name}_mask.png")
 
+                # Handle per-model saving depending on model_type and output shape
+                if model_type == 'segmentation':
+                    # out_single expected shape [1,H,W] or [H,W]
+                    mask_tensor = out_single.squeeze()
+                    mask = mask_tensor.cpu().numpy()
+                else:
+                    # autoencoder or other: treat outputs as reconstructed images
+                    # out_single shape [C,H,W]
+                    out_np = out_single.cpu().numpy()
+                    # if C==1 produce single-channel grayscale, if C==3 produce RGB
+                    if out_np.ndim == 3:
+                        img_np = np.transpose(out_np, (1, 2, 0))  # H,W,C
+                        # clamp to [0,1]
+                        img_np = np.clip(img_np, 0, 1)
+                        # save as color image
+                        try:
+                            plt.imsave(mask_save_path, img_np)
+                        except Exception:
+                            cv2.imwrite(mask_save_path, (img_np * 255).astype('uint8'))
+                        outputs_saved.append(os.path.abspath(mask_save_path))
+                        print(f"Saved recon for {base_name} -> {mask_save_path}")
+                        continue
+                    else:
+                        # fall back
+                        mask = out_single.squeeze().cpu().numpy()
+
                 # Save raw grayscale mask (0/255) using matplotlib to ensure consistent display
                 try:
-                    # mask is 0/1 int; convert to 0-255 uint8
-                    # Squeeze channel dim and scale to 0-255 for saving
-                    #mask_uint8 = (np.squeeze(mask, axis=0) * 255).astype('uint8')
+                    # mask is 0/1 bool or probability array — convert to 0-255 uint8
+                    mask_uint8 = (mask * 255).astype('uint8') if mask.dtype != np.uint8 else mask
                     plt.imsave(mask_save_path, mask, cmap='gray')
                 except Exception:
                     # fallback to cv2 if matplotlib save fails
@@ -819,7 +937,7 @@ def eval_flower102_color(model_name, num_channels = [64, 128, 256, 512, 1024, 51
     visualize_reconstructions_flower102(model, test_loader, device, results_dir, avg_loss)
 
 
-def eval_vae(num_samples = 16):
+""" def eval_vae(num_samples = 16):
     output_visualizations_directory = "results_VAE"
     set_seed(42)
     if not os.path.exists(output_visualizations_directory):
@@ -841,4 +959,4 @@ def eval_vae(num_samples = 16):
         ax.axis('off')
     plt.tight_layout()
     plt.savefig(f'{output_visualizations_directory}/vae_3_alpha_1_seeded(42).png')
-    plt.show()
+    plt.show() """

@@ -1,6 +1,6 @@
 // components/OutputPreviewPane.tsx
 "use client";
-// eslint-disable-next-line @next/next/no-img-element -- preview image comes from our backend and doesn't need Next image optimization in dev
+ 
 
 import { useImageGen } from "../ImageGenContext";
 import Image from "next/image";
