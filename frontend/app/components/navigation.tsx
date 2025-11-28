@@ -33,7 +33,7 @@ export default function NavigationBar() {
   ]
 
   return (
-    <nav className="flex items-center justify-between w-full px-6 py-4 border-b bg-background">
+    <nav className="flex items-center h-[70px] justify-between w-full px-6 py-4 border-b bg-background">
       {/* Left: App title */}
       <Link
         href="/"

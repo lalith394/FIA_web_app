@@ -1,0 +1,9 @@
+1. segmentation models --> 
+    a. model_d4_64
+    b. model_d4_32
+    c. model_d4_26
+2. classification models
+    a. vgg16_WBC
+3. autoencoders
+    a. ae_sk[d4]
+    
