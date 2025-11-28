@@ -22,7 +22,7 @@ export default function NavigationBar() {
     },
     {
       item: "Generate",
-      reference: "/generate",
+      reference: "/image-generation ",
       icon: BookAIcon
     },
     {
