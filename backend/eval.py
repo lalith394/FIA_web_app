@@ -10,6 +10,8 @@ from timeit import default_timer as timer
 import pandas as pd
 import numpy as np
 import cv2
+from PIL import Image
+from torchvision import transforms as T
 import torch.nn as nn
 from metrics import psnr, ssim
 import lpips
@@ -306,6 +308,143 @@ def eval(model_name, num_channels = [64, 128, 256, 512, 1024, 512, 256, 128, 64]
 
     # --- visualize_reconstructions (8 recontstructions) ---
     #visualize_segmentations(model, test_loader, device, results_dir)
+
+
+def infer_images(model_name, image_paths, threshold: float = 0.5, out_dir: str | None = None, save_features: bool = False, batch_size: int = 1):
+    """
+    Run segmentation inference with a trained UNet on a set of image file paths.
+
+    model_name: folder name under models/ (e.g. 'm[64]')
+    image_paths: list of file paths (strings) on disk to run inference on
+    threshold: float between 0 and 1 used to binarize sigmoid outputs
+    out_dir: output folder under output/<out_dir>. If None, defaults to model_name
+    save_features: if True, save d4 intermediate feature channels per image
+    """
+    set_seed(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if out_dir is None:
+        out_dir = model_name
+    results_dir = f"output/{out_dir}"
+    os.makedirs(results_dir, exist_ok=True)
+
+    model_dir = f"models/segmentation/{model_name}"
+    model_path = f"{model_dir}/{model_name}.pth"
+
+    # Try to read model-specific num_channels from metadata if available
+    try:
+        import json
+        meta_path = os.path.join(model_dir, "metadata.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r', encoding='utf8') as f:
+                meta = json.load(f)
+                num_channels = meta.get('parameters', {}).get('num_channels', {}).get('default', None)
+                if num_channels is None:
+                    num_channels = [64, 128, 256, 512, 1024, 512, 256, 128, 64]
+        else:
+            num_channels = [64, 128, 256, 512, 1024, 512, 256, 128, 64]
+    except Exception:
+        num_channels = [64, 128, 256, 512, 1024, 512, 256, 128, 64]
+
+    # Load model
+    model = UNet(num_channels=[64, 128, 256, 512, 1024, 512, 256, 128, 64]).to(device)
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+
+    checkpoint = torch.load(model_path, map_location=device)
+    state = checkpoint.get('model_state_dict', checkpoint)
+    model.load_state_dict(state)
+    model.eval()
+
+    # Compose PIL-based transform to ensure tensors are floats in [0,1]
+    pil_transform = T.Compose([
+        T.Resize((384, 576)),
+        T.ToTensor(),
+    ])
+
+    # No preprocessing is applied here — use raw model outputs (grayscale masks)
+
+    outputs_saved = []
+
+    with torch.no_grad():
+        # Process in batches
+        for start in range(0, len(image_paths), batch_size):
+            batch_paths = image_paths[start : start + batch_size]
+            tensors = []
+            valid_paths = []
+
+            # Load and preprocess each image in the batch using PIL + ToTensor
+            for img_path in batch_paths:
+                try:
+                    # PIL open + convert ensures we have an RGB image
+                    pil_img = Image.open(img_path).convert("RGB")
+                    tensor = pil_transform(pil_img)  # C,H,W float32 in [0,1]
+
+                except Exception as e:
+                    print(f"Skipping {img_path}: failed to open with PIL ({e})")
+                    continue
+                tensors.append(tensor)
+                valid_paths.append(img_path)
+
+            if len(tensors) == 0:
+                continue
+
+            inp = torch.stack(tensors, dim=0).to(device)
+            # Debug: report shape of batch
+            try:
+                print(f"infer_images: batch input shape = {tuple(inp.shape)} (B,C,H,W)")
+            except Exception:
+                pass
+
+            # run forward with features
+            outputs, d4_feats = model(inp, return_features=True)
+            # Debug: output shapes
+            try:
+                print(f"infer_images: model outputs shape = {tuple(outputs.shape)} (B,1,H,W) - d4_feats shape = {tuple(d4_feats.shape) if d4_feats is not None else 'None'}")
+            except Exception:
+                pass
+            outputs = torch.sigmoid(outputs)
+            # outputs shape [B, 1, H, W] — threshold and save per sample
+            for i in range(outputs.shape[0]):
+                out_single = outputs[i]
+                print(out_single)
+                
+                # Apply threshold argument to binarize prediction
+                mask = (out_single).squeeze().cpu().numpy()  # shape [1,H,W]
+                img_path = valid_paths[i]
+
+                base_name = os.path.splitext(os.path.basename(img_path))[0]
+                mask_save_path = os.path.join(results_dir, f"{base_name}_mask.png")
+
+                # Save raw grayscale mask (0/255) using matplotlib to ensure consistent display
+                try:
+                    # mask is 0/1 int; convert to 0-255 uint8
+                    # Squeeze channel dim and scale to 0-255 for saving
+                    #mask_uint8 = (np.squeeze(mask, axis=0) * 255).astype('uint8')
+                    plt.imsave(mask_save_path, mask, cmap='gray')
+                except Exception:
+                    # fallback to cv2 if matplotlib save fails
+                    cv2.imwrite(mask_save_path, (mask * 255).astype('uint8'))
+
+                outputs_saved.append(os.path.abspath(mask_save_path))
+
+                # optionally save features
+                if save_features:
+                    feat_dir = os.path.join(results_dir, f"{base_name}_d4_layer")
+                    os.makedirs(feat_dir, exist_ok=True)
+                    # d4_feats shape [B, C, H, W]
+                    d4_np = d4_feats[i].cpu().numpy()
+                    for ch in range(d4_np.shape[0]):
+                        feat_map = d4_np[ch]
+                        feat_map = (feat_map - feat_map.min()) / (feat_map.max() - feat_map.min() + 1e-8)
+                        feat_map = (feat_map * 255).astype('uint8')
+                        feat_out = os.path.join(feat_dir, f"channel_{ch}.png")
+                        cv2.imwrite(feat_out, feat_map)
+                    print(f"Saved features for {base_name} -> {feat_dir}")
+
+                print(f"Saved mask for {base_name} -> {mask_save_path}")
+
+    return outputs_saved
 
 def save_predictions(model, dataloader, device, results_dir):
     """

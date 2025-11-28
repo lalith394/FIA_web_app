@@ -11,7 +11,7 @@ export interface ImageFile {
 type Config = {
   threshold: number;
   batchSize: number;
-  preprocessing: string;
+  saveFeatures?: boolean;
 };
 
 export interface ImageGenState {
@@ -41,7 +41,7 @@ const defaultState: ImageGenState = {
   outputDir: `/outputs/${new Date().toISOString().slice(0, 10)}/`,
   // eslint-disable-next-line @typescript-eslint/no-empty-function
   setOutputDir: () => {},
-  config: { threshold: 0.5, batchSize: 1, preprocessing: "Normalize Only" },
+  config: { threshold: 0.5, batchSize: 1, saveFeatures: false },
   // eslint-disable-next-line @typescript-eslint/no-empty-function
   setConfig: () => {},
   // eslint-disable-next-line @typescript-eslint/no-empty-function
@@ -50,7 +50,7 @@ const defaultState: ImageGenState = {
 
 const ImageGenContext = createContext<ImageGenState>(defaultState);
 
-export const ImageGenProvider: React.FC<React.PropsWithChildren<{}>> = ({ children }) => {
+export const ImageGenProvider: React.FC<React.PropsWithChildren<object>> = ({ children }) => {
   const [images, setImages] = useState<ImageFile[]>([]);
   const [singleImage, setSingleImage] = useState<ImageFile | null>(null);
   const [model, setModel] = useState<string | null>(null);
