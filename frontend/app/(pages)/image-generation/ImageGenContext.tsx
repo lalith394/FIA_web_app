@@ -25,6 +25,14 @@ export interface ImageGenState {
   setOutputDir: (v: string) => void;
   config: Config;
   setConfig: (patch: Partial<Config>) => void;
+  // outputs produced by the backend as accessible URLs
+  generatedOutputs: string[];
+  setGeneratedOutputs: (v: string[]) => void;
+  // loading / progress helpers to show progress in UI
+  loading: boolean;
+  setLoading: (v: boolean) => void;
+  progressPercent: number;
+  setProgressPercent: (v: number) => void;
   reset: () => void;
 }
 
@@ -44,6 +52,15 @@ const defaultState: ImageGenState = {
   config: { threshold: 0.5, batchSize: 1, saveFeatures: false },
   // eslint-disable-next-line @typescript-eslint/no-empty-function
   setConfig: () => {},
+  generatedOutputs: [],
+  // eslint-disable-next-line @typescript-eslint/no-empty-function
+  setGeneratedOutputs: () => {},
+  loading: false,
+  // eslint-disable-next-line @typescript-eslint/no-empty-function
+  setLoading: () => {},
+  progressPercent: 0,
+  // eslint-disable-next-line @typescript-eslint/no-empty-function
+  setProgressPercent: () => {},
   // eslint-disable-next-line @typescript-eslint/no-empty-function
   reset: () => {},
 };
@@ -56,6 +73,9 @@ export const ImageGenProvider: React.FC<React.PropsWithChildren<object>> = ({ ch
   const [model, setModel] = useState<string | null>(null);
   const [outputDir, setOutputDir] = useState<string>(defaultState.outputDir);
   const [config, rawSetConfig] = useState<Config>(defaultState.config);
+  const [generatedOutputs, setGeneratedOutputs] = useState<string[]>([]);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [progressPercent, setProgressPercent] = useState<number>(0);
 
   const setConfig = (patch: Partial<Config>) => rawSetConfig((cur) => ({ ...cur, ...patch }));
 
@@ -65,10 +85,14 @@ export const ImageGenProvider: React.FC<React.PropsWithChildren<object>> = ({ ch
     setModel(null);
     setOutputDir(`/outputs/${new Date().toISOString().slice(0, 10)}/`);
     rawSetConfig(defaultState.config);
+    // clear generated outputs / progress
+    setGeneratedOutputs([]);
+    setLoading(false);
+    setProgressPercent(0);
   };
 
   return (
-    <ImageGenContext.Provider value={{ images, setImages, singleImage, setSingleImage, model, setModel, outputDir, setOutputDir, config, setConfig, reset }}>
+    <ImageGenContext.Provider value={{ images, setImages, singleImage, setSingleImage, model, setModel, outputDir, setOutputDir, config, setConfig, generatedOutputs, setGeneratedOutputs, loading, setLoading, progressPercent, setProgressPercent, reset }}>
       {children}
     </ImageGenContext.Provider>
   );

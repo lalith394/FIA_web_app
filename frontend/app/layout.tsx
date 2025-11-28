@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import { ThemeProvider } from "next-themes";
+import ToastProvider from "../components/ui/toast";
 import NavigationBar from "./components/navigation";
 
 
@@ -18,8 +19,10 @@ export default function RootLayout({
     <html lang="en" suppressHydrationWarning>
       <body>
         <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
-          <NavigationBar />
-          {children}
+          <ToastProvider>
+            <NavigationBar />
+            {children}
+          </ToastProvider>
         </ThemeProvider>
       </body>
     </html>

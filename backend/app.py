@@ -1,5 +1,7 @@
 # backend/app.py
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
+import shutil
+from urllib.parse import urlparse
 import json
 from eval import infer_images
 import os
@@ -13,6 +15,71 @@ CORS(app)  # Enable CORS so frontend (Next.js) can talk to backend
 @app.route('/')
 def home():
     return jsonify(message="Flask backend is running!")
+
+
+@app.route('/output/<path:filename>')
+def serve_output(filename):
+    # Serve generated output files (masks/features) from the backend output directory
+    output_dir = os.path.join(os.getcwd(), 'output')
+    return send_from_directory(output_dir, filename)
+
+
+@app.route('/api/save_outputs', methods=['POST'])
+def save_outputs():
+    data = request.get_json() or {}
+    urls = data.get('urls', [])
+    dest_dir = data.get('dest_dir', '')
+
+    if not urls:
+        return jsonify({'ok': False, 'message': 'No files provided'}), 400
+
+    output_root = os.path.join(os.getcwd(), 'output')
+    saved_urls = []
+
+    # normalize dest_dir to relative path inside output
+    dest_dir = str(dest_dir or '').lstrip('/\\')
+    dest_dir = dest_dir.strip()
+
+    for url in urls:
+        try:
+            # if url is absolute URL, extract path
+            if isinstance(url, str) and url.startswith('http'):
+                parsed = urlparse(url)
+                path = parsed.path
+            else:
+                path = url
+
+            if path.startswith('/output/'):
+                rel = path[len('/output/'):]
+            else:
+                rel = os.path.basename(path)
+
+            src = os.path.join(output_root, rel)
+            if not os.path.exists(src):
+                # try fallback: maybe 'output/<rel>' already
+                continue
+
+            dest_base = os.path.join(output_root, dest_dir) if dest_dir else output_root
+            os.makedirs(dest_base, exist_ok=True)
+
+            filename = os.path.basename(src)
+            dest = os.path.join(dest_base, filename)
+
+            # avoid overwriting files
+            base, ext = os.path.splitext(filename)
+            counter = 1
+            while os.path.exists(dest):
+                dest = os.path.join(dest_base, f"{base}_{counter}{ext}")
+                counter += 1
+
+            shutil.copy2(src, dest)
+            rel_dest = os.path.relpath(dest, start=output_root).replace('\\', '/')
+            saved_urls.append(f"{request.host_url.rstrip('/')}/output/{rel_dest}")
+        except Exception as e:
+            print(f"save_outputs: failed to copy {url}: {e}")
+            continue
+
+    return jsonify({'ok': True, 'saved': saved_urls})
 
 @app.route('/api/test', methods=['POST'])
 def test_api():
@@ -110,6 +177,20 @@ def generate_api():
                     print(f"Inference returned generated: {generated}")
                     if not generated:
                         print("Warning: inference returned no generated files.")
+                    else:
+                        # convert absolute file paths into backend-accessible URLs under /output/<path>
+                        generated_urls = []
+                        output_root = os.path.join(os.getcwd(), 'output')
+                        for p in generated:
+                            try:
+                                rel = os.path.relpath(p, start=output_root)
+                            except Exception:
+                                rel = os.path.basename(p)
+                            rel = rel.replace('\\', '/')
+                            # build absolute URL using request.host_url
+                            base = request.host_url.rstrip('/')
+                            generated_urls.append(f"{base}/output/{rel}")
+                        generated = generated_urls
                 except Exception as e:
                     return jsonify({'ok': False, 'message': f'Error running inference: {e}'}), 500
 

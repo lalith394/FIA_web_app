@@ -414,7 +414,16 @@ def infer_images(model_name, image_paths, threshold: float = 0.5, out_dir: str |
                 img_path = valid_paths[i]
 
                 base_name = os.path.splitext(os.path.basename(img_path))[0]
-                mask_save_path = os.path.join(results_dir, f"{base_name}_mask.png")
+                # Prefer to preserve relative folder structure under 'uploads' when saving masks
+                uploads_root = os.path.join(os.getcwd(), 'uploads')
+                if os.path.commonpath([os.path.abspath(img_path), uploads_root]) == os.path.abspath(uploads_root):
+                    rel = os.path.relpath(img_path, start=uploads_root)
+                    rel_dir = os.path.dirname(rel)
+                    dest_dir = os.path.join(results_dir, rel_dir)
+                    os.makedirs(dest_dir, exist_ok=True)
+                    mask_save_path = os.path.join(dest_dir, f"{base_name}_mask.png")
+                else:
+                    mask_save_path = os.path.join(results_dir, f"{base_name}_mask.png")
 
                 # Save raw grayscale mask (0/255) using matplotlib to ensure consistent display
                 try:
