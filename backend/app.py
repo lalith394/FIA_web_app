@@ -3,7 +3,7 @@ from flask import Flask, jsonify, request, send_from_directory
 import shutil
 from urllib.parse import urlparse
 import json
-from eval import infer_images
+from eval import infer_images, find_model_metadata
 import os
 from werkzeug.utils import secure_filename
 from datetime import datetime
@@ -101,7 +101,7 @@ def generate_api():
         return jsonify({'ok': False, 'message': 'No files uploaded'}), 400
 
     # Create an uploads directory with timestamp
-    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     save_dir = os.path.join(os.getcwd(), 'uploads', ts)
     os.makedirs(save_dir, exist_ok=True)
 
@@ -129,31 +129,16 @@ def generate_api():
             except Exception:
                 cfg = {}
 
-            # detect model type via metadata if available
+            # detect model type via metadata if available (search all model dirs)
             try:
-                # Prefer segmentation model metadata location
-                meta_path_seg = os.path.join(os.getcwd(), 'models', 'segmentation', model, 'metadata.json')
-                meta_path_root = os.path.join(os.getcwd(), 'models', model, 'metadata.json')
-
-                if os.path.exists(meta_path_seg):
-                    with open(meta_path_seg, 'r', encoding='utf8') as mf:
-                        meta = json.load(mf)
-                        mtype = meta.get('type')
-                elif os.path.exists(meta_path_root):
-                    with open(meta_path_root, 'r', encoding='utf8') as mf:
-                        meta = json.load(mf)
-                        mtype = meta.get('type')
-                else:
-                    # If no metadata exists, guess 'segmentation' if model folder exists under models/segmentation
-                    seg_folder = os.path.join(os.getcwd(), 'models', 'segmentation', model)
-                    if os.path.isdir(seg_folder):
-                        mtype = 'segmentation'
-                    else:
-                        mtype = None
-            except Exception:
+                models_root = os.path.join(os.getcwd(), 'models')
+                mtype, _, _ = find_model_metadata(models_root, model)
+            except FileNotFoundError:
+                # fallback: no metadata found
                 mtype = None
 
-            if mtype == 'segmentation':
+            # Run inference for segmentation and autoencoder model types (both produce image outputs)
+            if mtype in ('segmentation', 'autoencoder'):
                 # Helper to parse booleans from form/config values
                 def parse_bool(v):
                     if isinstance(v, bool):
@@ -171,6 +156,14 @@ def generate_api():
                 save_feats = parse_bool(cfg.get('save_features', cfg.get('saveFeatures', request.form.get('save_features', False))))
 
                 out_dir_for_gen = output_dir or model
+                # Prevent API callers from forcing the backend to save outputs
+                # to arbitrary absolute filesystem locations. If the client
+                # supplies an absolute path, map it into the backend's
+                # output/ directory (use basename) so generated files are
+                # always served under /output/ and accessible from the UI.
+                if isinstance(out_dir_for_gen, str) and os.path.isabs(out_dir_for_gen):
+                    # prefer a safe basename inside output/
+                    out_dir_for_gen = os.path.basename(out_dir_for_gen) or model
                 try:
                     print(f"Running inference for model={model}, files={saved_paths}, threshold={threshold}, batch_size={batch_size}, save_features={save_feats}")
                     generated = infer_images(model, saved_paths, threshold=threshold, out_dir=out_dir_for_gen, save_features=save_feats, batch_size=batch_size)

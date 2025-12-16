@@ -29,7 +29,7 @@ export default function HeroSection() {
         </p>
 
         <div className="pt-4">
-          <Link href={"/docs"}>
+          <Link href={"/image-generation"}>
             <button className="px-6 py-3 bg-primary text-primary-foreground rounded-xl hover:scale-105 transition-transform cursor-pointer">
               Get Started
             </button>

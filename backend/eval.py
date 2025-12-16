@@ -1,962 +1,322 @@
-import torch
-from utils import load_dataset, set_seed, full_dataset, load_idrid_grayscale_aug, load_rfmid, load_rfmid_color, load_flowers102
-import matplotlib.pyplot as plt
-from tqdm import tqdm
+"""
+Lightweight, modular inference helpers for segmentation / autoencoder models.
+
+This file intentionally focuses only on reusable inference functions used by the
+backend API: finding model metadata, loading the model, reading images from disk,
+processing them into tensors, running inference, and saving outputs (masks or
+reconstructions). The old monolithic evaluation helpers and visualization code
+were removed to keep this module small and focused.
+
+Public helpers:
+- find_model_metadata(model_name) -> (model_type, model_dir, metadata)
+- load_model(model_dir, model_name, model_type, num_channels) -> torch.nn.Module
+- read_image(path, size=(H,W)) -> torch.Tensor (C,H,W), float in [0,1]
+- save_image(np_array, path, as_rgb=False) -> None
+- infer_images(model_name, image_paths, threshold=0.5, out_dir=None, save_features=False, batch_size=1, rgb=False)
+
+The infer_images function returns a list of file paths written on disk.
+"""
+
+from __future__ import annotations
+
+import json
 import os
-from model import UNet, AutoEncoder, AutoEncoder_RFMiD
-from metrics import DiceLoss
-from sklearn.metrics import accuracy_score, jaccard_score, precision_score, f1_score, recall_score
-from timeit import default_timer as timer
-import pandas as pd
+from typing import List, Optional, Tuple
+
 import numpy as np
-import cv2
 from PIL import Image
+import matplotlib.pyplot as plt
+
+import torch
 from torchvision import transforms as T
-import torch.nn as nn
-from metrics import psnr, ssim
-import lpips
 
-def save_results_rgb(ori_y, y_pred, save_image_path):
-
-    pred_image = np.zeros((y_pred.shape[0], y_pred.shape[1], 3))
-    _y_pred = y_pred[:, :]
-    _ori_y = ori_y[:, :]
-    pred_image[:, :, 0] = ((_y_pred > 0.5) & (_ori_y <= 0.5)) * 255
-    pred_image[:, :, 1] = ((_y_pred > 0.5) & (_ori_y  > 0.5)) * 255
-    pred_image[:, :, 2] = ((_ori_y  > 0.5) & (_y_pred <= 0.5 )) * 255
-
-    print(" saving result", save_image_path)
-    cv2.imwrite(save_image_path, pred_image)
-
-def save_normal_results(_, y_pred, save_image_path):
-    y_pred = np.expand_dims(y_pred, axis=-1)
-    y_pred = np.concatenate([y_pred, y_pred, y_pred], axis=-1) * 255
-    cv2.imwrite(save_image_path, y_pred)
-
-""" Visualization of predictions """
-def visualize_segmentations(model, test_loader, device, output_dir):
-    model.eval()
-    imgs, masks, names = next(iter(test_loader))
-    imgs = imgs.to(device)
-
-    with torch.no_grad():
-        outputs = model(imgs)
-        outputs = torch.sigmoid(outputs)  # for binary masks
-
-    # Move to CPU for plotting
-    imgs = imgs.cpu()
-    outputs = outputs.cpu()
-
-    n = min(8, imgs.size(0))  # number of images to show
-    plt.figure(figsize=(16, 4))
-
-    for i in range(n):
-        # Original RGB image (CHW -> HWC)
-        img_np = imgs[i].permute(1, 2, 0).numpy()
-        img_np = (img_np * 255).astype("uint8")  # if normalized [0,1]
-
-        # Predicted mask
-        mask_np = outputs[i].squeeze().numpy()
-
-        # Original
-        plt.subplot(2, n, i + 1)
-        plt.imshow(img_np)
-        plt.title(f"Original: {names}")
-        plt.axis('off')
-
-        # Prediction
-        plt.subplot(2, n, i + 1 + n)
-        plt.imshow(mask_np, cmap='gray')
-        plt.title("Predicted Mask")
-        plt.axis('off')
-
-    plt.tight_layout()
-    plt.savefig(f'{output_dir}/visualization.png')
-    plt.show()
-
-def visualize_reconstructions(model, test_loader, device, results_dir, avg_loss):
-    model.eval()
-    imgs, _, name = next(iter(test_loader))
-    imgs = imgs.to(device)
-    with torch.no_grad():
-        outputs = model(imgs)
-
-    imgs = imgs.cpu()
-    outputs = outputs.cpu()
-
-    n = 4  # number of images to show
-    plt.figure(figsize=(16,6))
-    plt.title(f'Avg.loss: {avg_loss}')
-    plt.axis('off')
-    for i in range(n):
-        # Original
-        plt.subplot(2, n, i + 1)
-        plt.imshow(imgs[i].squeeze(), cmap='gray')
-        plt.title(f"{name[i]}")
-        plt.axis('off')
-
-        # Reconstructed
-        plt.subplot(2, n, i + 1 + n)
-        plt.imshow(outputs[i].squeeze(), cmap='gray')
-        plt.title("Reconstructed")
-        plt.axis('off')
-    
-    plt.tight_layout()
-    plt.savefig(f'{results_dir}/visualization.png')
-    plt.show()
-
-def visualize_reconstructions_color(model, test_loader, device, results_dir, eval_res):
-    model.eval()
-
-    imgs, _, names = next(iter(test_loader))
-    imgs = imgs.to(device)
-
-    with torch.no_grad():
-        outputs = model(imgs)
-
-    imgs = imgs.cpu()
-    outputs = outputs.cpu()
-
-    n = min(4, imgs.size(0))  # number of images to show (max 4)
-    plt.figure(figsize=(16, 8))
-    plt.suptitle(f'{eval_res}', fontsize=10)
-
-    for i in range(n):
-        # --- Original Image ---
-        plt.subplot(2, n, i + 1)
-        img_np = imgs[i].permute(1, 2, 0).numpy()  # (C,H,W) → (H,W,C)
-        #img_np = np.clip(img_np, 0, 1)              # ensure values in [0,1]
-        plt.imshow(img_np)
-        plt.title(f"{names[i]}")
-        plt.axis('off')
-
-        # --- Reconstructed Image ---
-        plt.subplot(2, n, i + 1 + n)
-        out_np = outputs[i].permute(1, 2, 0).numpy()
-        #out_np = np.clip(out_np, 0, 1)
-        plt.imshow(out_np)
-        plt.title("Reconstructed")
-        plt.axis('off')
-
-    plt.tight_layout()
-    os.makedirs(results_dir, exist_ok=True)
-    plt.savefig(os.path.join(results_dir, 'visualization.png'))
-    plt.show()
-
-def visualize_reconstructions_flower102(model, test_loader, device, results_dir, avg_loss):
-    model.eval()
-
-    imgs, names = next(iter(test_loader))
-    imgs = imgs.to(device)
-
-    with torch.no_grad():
-        outputs = model(imgs)
-
-    imgs = imgs.cpu()
-    outputs = outputs.cpu()
-
-    n = min(4, imgs.size(0))  # number of images to show (max 4)
-    plt.figure(figsize=(16, 6))
-    plt.suptitle(f'Avg. Loss: {avg_loss:.6f}', fontsize=14)
-
-    for i in range(n):
-        # --- Original Image ---
-        plt.subplot(2, n, i + 1)
-        img_np = imgs[i].permute(1, 2, 0).numpy()  # (C,H,W) → (H,W,C)
-        #img_np = np.clip(img_np, 0, 1)              # ensure values in [0,1]
-        plt.imshow(img_np)
-        plt.title(f"{names[i]}")
-        plt.axis('off')
-
-        # --- Reconstructed Image ---
-        plt.subplot(2, n, i + 1 + n)
-        out_np = outputs[i].permute(1, 2, 0).numpy()
-        #out_np = np.clip(out_np, 0, 1)
-        plt.imshow(out_np)
-        plt.title("Reconstructed")
-        plt.axis('off')
-
-    plt.tight_layout()
-    os.makedirs(results_dir, exist_ok=True)
-    plt.savefig(os.path.join(results_dir, 'visualization.png'))
-    plt.show()
+from model import UNet, AutoEncoder, AutoEncoder_RFMiD
 
 
-def eval(model_name, num_channels = [64, 128, 256, 512, 1024, 512, 256, 128, 64], dataset_path = "Data_source/Augmented/Data", out_dir = None, test_dataset = True, shuffle = True, rgb = False):
-    # --- Config ---
-    set_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    batch_size = 1
-    model_dir = f'models/{model_name}'
-    model_path = f'{model_dir}/{model_name}.pth'
-    dataset_path = dataset_path
-    if out_dir is None:
-        out_dir = model_name
-    results_dir = f"output/{out_dir}"
+def find_model_metadata(models_root: str, model_name: str) -> Tuple[str, str, dict]:
+    """Search models/<type>/<model_name>/metadata.json then models/<model_name>/metadata.json.
 
-    if(not os.path.exists(results_dir) and rgb is not None):
-        os.makedirs(results_dir)
-
-    if(not os.path.exists(model_dir)):
-        os.makedirs(model_dir)
-        
-    # --- Load test data ---
-    if(test_dataset is True):
-        _, test_loader = load_dataset(dataset_path, batch_size=batch_size, shuffle=shuffle)
-    elif (test_dataset is False):
-       test_loader, _ = load_dataset(dataset_path, batch_size=batch_size, shuffle=shuffle)
-    else:
-        test_loader = full_dataset(dataset_path, batch_size=batch_size, shuffle=shuffle)
-
-    # --- Load model ---
-    model = UNet(num_channels=num_channels).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device)['model_state_dict'])
-    model.eval()
-
-    # --- Define loss function ---
-    criterion = DiceLoss()
-
-    # --- Evaluate ---
-    total_loss = 0.0
-
-    SCORE = []
-    with torch.no_grad():
-        start_time = timer()
-        for imgs, masks, names in tqdm(test_loader):
-            imgs = imgs.to(device)
-            masks = masks.to(device)
-            outputs, d4_feats = model(imgs, return_features = True)
-            p1 = (outputs > 0.5).int().squeeze(1) #[1, 384, 576]
-
-            #Saving Predictions
-            for i in range(imgs.size(0)):
-                img_name = names[i] if isinstance(names[i], str) else f"img_{i}.png"
-                save_path = os.path.join(results_dir, img_name)
-                if rgb is None:
-                    break
-                if rgb is True:
-                    save_results_rgb(masks[i].cpu().squeeze(), p1[i].cpu(), save_path)
-                else:
-                    save_normal_results(masks[i].cpu().squeeze(), p1[i].cpu(), save_path)
-            
-            #Saving Intermediate feature channels
-            for i in range(imgs.size(0)):
-                img_name = names[i] if isinstance(names[i], str) else f"img_{i}"
-                feature_dir = os.path.join(results_dir, f"{img_name}_d4_layer")
-                os.makedirs(feature_dir, exist_ok=True)
-
-                # d4_feats shape: [B, C, H, W]
-                d4_np = d4_feats[i].cpu().numpy()  # shape [64, H, W]
-
-                for ch in range(d4_np.shape[0]):
-                    feat_map = d4_np[ch]
-
-                    # Normalize to [0,255] for saving
-                    feat_map = (feat_map - feat_map.min()) / (feat_map.max() - feat_map.min() + 1e-8)
-                    feat_map = (feat_map * 255).astype("uint8")
-
-                    save_path = os.path.join(feature_dir, f"channel_{ch}.png")
-                    cv2.imwrite(save_path, feat_map)
-            
-            #metrics evaluation
-            preds = (outputs > 0.5).int()  # Threshold at 0.5
-            # Squeeze and convert to numpy
-            y_true = masks.squeeze().cpu().numpy().astype(int)
-            y_pred = preds.squeeze().cpu().numpy().astype(int)
-            # Flatten
-            y_true_flat = y_true.flatten()
-            y_pred_flat = y_pred.flatten()
-
-            loss = criterion(outputs, masks)
-            total_loss += loss.item()
-
-            """ Calculate the metrics """
-            acc_value = accuracy_score(y_true_flat, y_pred_flat)
-            f1_value = f1_score(y_true_flat, y_pred_flat, labels=[0, 1], average="binary")
-            jac_value = jaccard_score(y_true_flat, y_pred_flat, labels=[0, 1], average="binary")
-            recall_value = recall_score(y_true_flat, y_pred_flat, labels=[0, 1], average="binary")
-            precision_value = precision_score(y_true_flat, y_pred_flat, labels=[0, 1], average="binary")
-            SCORE.append([names, acc_value, f1_value, jac_value, recall_value, precision_value])
-        end_time = timer()
-        score = [s[1:] for s in SCORE]
-        score = np.mean(score, axis=0)
-        print(f"Accuracy: {score[0]:0.5f}")
-        print(f"F1: {score[1]:0.5f}")
-        print(f"Jaccard: {score[2]:0.5f}")
-        print(f"Recall: {score[3]:0.5f}")
-        print(f"Precision: {score[4]:0.5f}")
-        print(f"Avg. Time taken: {end_time - start_time} seconds")
-        stats = [[model_dir, f"{len(test_loader)}", f"{score[0]:0.5f}", f"{score[1]:0.5f}", f"{score[2]:0.5f}", f"{score[3]:0.5f}", f"{score[4]:0.5f}", f"{end_time - start_time}"]]
-        data_stats = pd.DataFrame(stats, columns=["Model", "# Images", "Accuracy", "F1", "Jaccard", "Recall", "Precision", "Time"])
-
-        # CSV file path
-        csv_file = f"{model_dir}/stats.csv"
-        file_exists = os.path.isfile(csv_file)
-
-        # Write or append
-        data_stats.to_csv(csv_file, mode='a', header=not file_exists, index=False)
-        """ Saving """
-        df = pd.DataFrame(SCORE, columns=["Image", "Acc", "F1", "Jaccard", "Recall", "Precision"])
-        df.to_csv(f"{model_dir}/score_all.csv")
-            
-            
-
-    avg_loss = total_loss / len(test_loader)
-
-    print(f"\n🔍 Test Segmentation Loss (Dice_loss): {avg_loss:.6f}")
-    #print(f"\n🔍 Test Accuracy : {avg_acc:.6f}")
-
-    # --- visualize_reconstructions (8 recontstructions) ---
-    #visualize_segmentations(model, test_loader, device, results_dir)
-
-
-def infer_images(model_name, image_paths, threshold: float = 0.5, out_dir: str | None = None, save_features: bool = False, batch_size: int = 1):
+    Returns: (model_type, model_dir, metadata)
+    Raises FileNotFoundError if metadata not found.
     """
-    Run segmentation inference with a trained UNet on a set of image file paths.
-
-    model_name: folder name under models/ (e.g. 'm[64]')
-    image_paths: list of file paths (strings) on disk to run inference on
-    threshold: float between 0 and 1 used to binarize sigmoid outputs
-    out_dir: output folder under output/<out_dir>. If None, defaults to model_name
-    save_features: if True, save d4 intermediate feature channels per image
-    """
-    set_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    if out_dir is None:
-        out_dir = model_name
-    results_dir = f"output/{out_dir}"
-    os.makedirs(results_dir, exist_ok=True)
-
-    model_dir = f"models/segmentation/{model_name}"
-    model_path = f"{model_dir}/{model_name}.pth"
-
-    # Load metadata dynamically by searching models/<type>/<model>/metadata.json or models/<model>/metadata.json
-    import json
-    models_root = os.path.join(os.getcwd(), 'models')
-
-    meta = None
-    model_type = None
-    model_dir = None
+    if not os.path.isdir(models_root):
+        raise FileNotFoundError(f"models root not found: {models_root}")
 
     # search under models/<type>/<model_name>
-    if os.path.isdir(models_root):
-        for t in os.listdir(models_root):
-            candidate = os.path.join(models_root, t, model_name)
-            if os.path.isdir(candidate):
-                candidate_meta = os.path.join(candidate, 'metadata.json')
-                if os.path.exists(candidate_meta):
-                    with open(candidate_meta, 'r', encoding='utf8') as f:
-                        meta = json.load(f)
-                        model_dir = candidate
-                        model_type = meta.get('type') or t
-                        break
-
-    # fallback: try models/<model_name>/metadata.json
-    if meta is None:
-        candidate = os.path.join(models_root, model_name)
-        meta_path_fallback = os.path.join(candidate, 'metadata.json')
-        if os.path.exists(meta_path_fallback):
-            with open(meta_path_fallback, 'r', encoding='utf8') as f:
+    for t in os.listdir(models_root):
+        cand = os.path.join(models_root, t, model_name)
+        meta_path = os.path.join(cand, 'metadata.json')
+        if os.path.isdir(cand) and os.path.exists(meta_path):
+            with open(meta_path, 'r', encoding='utf8') as f:
                 meta = json.load(f)
-                model_dir = candidate
-                model_type = meta.get('type')
+            model_type = meta.get('type') or t
+            return model_type, cand, meta
 
-    # final fallback: assume segmentation & folder under models/segmentation/<model_name>
-    if meta is None:
-        seg_candidate = os.path.join(models_root, 'segmentation', model_name)
-        if os.path.isdir(seg_candidate):
-            model_dir = seg_candidate
-            meta_path = os.path.join(seg_candidate, 'metadata.json')
-            if os.path.exists(meta_path):
-                with open(meta_path, 'r', encoding='utf8') as f:
-                    meta = json.load(f)
-                    model_type = meta.get('type', 'segmentation')
+    # fallback models/<model_name>/metadata.json
+    cand2 = os.path.join(models_root, model_name)
+    meta_path2 = os.path.join(cand2, 'metadata.json')
+    if os.path.exists(meta_path2):
+        with open(meta_path2, 'r', encoding='utf8') as f:
+            meta = json.load(f)
+        model_type = meta.get('type') or 'segmentation'
+        return model_type, cand2, meta
+
+    # final try segmentation/<model_name>
+    seg_cand = os.path.join(models_root, 'segmentation', model_name)
+    if os.path.isdir(seg_cand):
+        meta_path = os.path.join(seg_cand, 'metadata.json')
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r', encoding='utf8') as f:
+                meta = json.load(f)
+        else:
+            meta = {}
+        return 'segmentation', seg_cand, meta
+
+    raise FileNotFoundError(f"metadata not found for model {model_name}")
+
+
+def load_model(model_dir: str, model_name: str, model_type: str, num_channels: Optional[List[int]] = None, device: Optional[torch.device] = None) -> torch.nn.Module:
+    """Load a model given a directory and metadata info. Picks type-specific class.
+
+    model_dir should be the folder containing <model_name>.pth. If multiple .pth present,
+    the first one is used.
+    """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # resolve weight path
+    pth = os.path.join(model_dir, f"{model_name}.pth")
+    if not os.path.exists(pth):
+        candidates = [f for f in os.listdir(model_dir) if f.endswith('.pth')]
+        if not candidates:
+            raise FileNotFoundError(f"no .pth weights found in {model_dir}")
+        pth = os.path.join(model_dir, candidates[0])
+
+    # pick model type
+    if model_type == 'segmentation':
+        arch = UNet(num_channels=(num_channels or [64, 128, 256, 512, 1024, 512, 256, 128, 64])).to(device)
+    elif model_type == 'autoencoder':
+        arch = AutoEncoder_RFMiD(num_channels=(num_channels or [64, 128, 256, 512, 1024, 512, 256, 128, 64])).to(device)
+    else:
+        # default to UNet for unknown types
+        arch = UNet(num_channels=(num_channels or [64, 128, 256, 512, 1024, 512, 256, 128, 64])).to(device)
+
+    checkpoint = torch.load(pth, map_location=device)
+    state = checkpoint.get('model_state_dict', checkpoint)
+    arch.load_state_dict(state)
+    arch.eval()
+    return arch
+
+
+def read_image(path: str, size: Optional[Tuple[int, int]] = None) -> torch.Tensor:
+    """Read an image from disk and return a float32 tensor in range [0,1] shaped (C,H,W).
+
+    If size is provided it should be (H, W).
+    """
+    img = Image.open(path).convert('RGB')
+    if size is not None:
+        img = img.resize((int(size[1]), int(size[0])), Image.BILINEAR) # type: ignore
+    to_tensor = T.ToTensor()
+    return to_tensor(img).float()
+
+
+def save_image(arr: np.ndarray, path: str, binary: bool = False, threshold: float = 128) -> None:
+    """
+    Save a numpy array as a single-channel (grayscale) image using matplotlib.
+
+    Behavior:
+    - Float arrays are assumed to be in [0,1] and are clipped to that range.
+    - Integer arrays (e.g., uint8 in 0..255) are converted to float in [0,1] by dividing by 255.
+    - Multi-channel arrays are converted to grayscale via luminance.
+    - `binary` parameter is honored by converting values to 0 or 1 (NOT multiplied by 255).
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    img = np.asarray(arr)
+
+    # If CHW (C,H,W) convert to HWC
+    if img.ndim == 3 and img.shape[0] <= 4 and img.shape[0] != img.shape[2]:
+        img = np.transpose(img, (1, 2, 0))
+
+    # If multi-channel, convert to grayscale luminance
+    if img.ndim == 3:
+        if img.shape[2] == 3:
+            img = np.dot(img[..., :3], [0.299, 0.587, 0.114])
+        else:
+            img = img.mean(axis=2)
+
+    # Convert to float in [0,1]
+    if img.dtype in [np.uint8, np.int32, np.int64]:
+        img = (img.astype(np.float32) / 255.0)
+    else:
+        img = img.astype(np.float32)
+        if img.max() > 1.0:
+            # If values appear to be in 0..255, scale to 0..1
+            img = img / 255.0
+
+    # Apply binary threshold if requested (produce 0 or 1)
+    if binary:
+        img = (img > (threshold / 255.0)).astype(np.float32)
+
+    # Use matplotlib to write grayscale image. vmin/vmax ensures consistent mapping.
+    plt.imsave(path, img, cmap='gray', vmin=0.0, vmax=1.0)
+
+
+def process_batch(model: torch.nn.Module, batch: torch.Tensor, model_type: str, threshold: float = 0.5) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Run a model forward and return processed outputs and optional features.
+
+    For segmentation models this should return probabilities (sigmoid applied) or logits depending on model.
+    """
+    with torch.no_grad():
+        outputs = None
+        features = None
+        try:
+            out = model(batch, return_features=True)
+            # some models return (outputs, features)
+            if isinstance(out, tuple) and len(out) == 2:
+                outputs, features = out
             else:
-                model_type = 'segmentation'
+                outputs = out
+        except TypeError:
+            # model doesn't accept return_features
+            outputs = model(batch)
 
-    # If still no metadata found raise error
-    if meta is None:
-        raise FileNotFoundError(f"No metadata found for model '{model_name}' under {models_root}")
+        if model_type == 'segmentation':
+            outputs = torch.sigmoid(outputs) # type: ignore
+        return outputs, features # type: ignore
 
-    # parse parameters
+
+def infer_images(model_name: str, image_paths: List[str], threshold: float = 0.5, out_dir: Optional[str] = None, save_features: bool = False, batch_size: int = 1, rgb: bool = False) -> List[str]:
+    """Metadata-driven inference entrypoint.
+
+    - locates model metadata, loads the model, reads images, runs inference in batches
+    - writes masks/reconstructions to out_dir (absolute or relative to ./output)
+    - returns list of written file paths
+    """
+    try:
+        # try to use user's set_seed helper if present in utils
+        from utils import set_seed as _set_seed
+        _set_seed(42)
+    except Exception:
+        pass
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    models_root = os.path.join(os.getcwd(), 'models')
+    model_type, model_dir, meta = find_model_metadata(models_root, model_name)
+    print(model_type, model_dir)
+
     params = meta.get('parameters', {}) if isinstance(meta, dict) else {}
-    # num_channels: may be nested under parameters.num_channels.default OR a top-level list
     num_channels = None
     if 'num_channels' in params:
-        val = params.get('num_channels')
-        if isinstance(val, dict):
-            num_channels = val.get('default')
+        v = params['num_channels']
+        if isinstance(v, dict):
+            num_channels = v.get('default')
         else:
-            num_channels = val
-    elif meta.get('num_channels'):
-        num_channels = meta.get('num_channels')
+            num_channels = v
 
-    if not num_channels:
-        # default UNet layout
-        num_channels = [64, 128, 256, 512, 1024, 512, 256, 128, 64]
-
-    # resolution: accept parameters.resolution.default or parameters.image_resolution or top-level resolution
     res = None
     if 'resolution' in params:
-        r = params.get('resolution')
-        if isinstance(r, dict):
-            res = r.get('default')
+        v = params['resolution']
+        if isinstance(v, dict):
+            res = v.get('default')
         else:
-            res = r
-    if not res and meta.get('resolution'):
-        res = meta.get('resolution')
-
-    # default segmentation res is [384, 576] (height, width)
+            res = v
+    # defaults
     if model_type == 'segmentation' and (not res or len(res) != 2):
         res = [384, 576]
 
-    # validate res
-    if res and (not isinstance(res, (list, tuple)) or len(res) != 2):
-        res = None
-
-    # Resolve model_path inside the discovered model_dir
-    if model_dir is None:
-        raise FileNotFoundError(f"Model directory not found for model '{model_name}'")
-    
-    model_path = os.path.join(model_dir, f"{model_name}.pth")
-    if not os.path.exists(model_path):
-        # fallback: pick any .pth in the model_dir
-        pths = [f for f in os.listdir(model_dir) if f.endswith('.pth')]
-        if pths:
-            model_path = os.path.join(model_dir, pths[0])
-        else:
-            raise FileNotFoundError(f"Model file not found in: {model_dir}")
-
-    # Instantiate model according to type
-    if model_type == 'segmentation':
-        model = UNet(num_channels=num_channels).to(device)
-    elif model_type == 'autoencoder':
-        model = AutoEncoder(num_channels=num_channels).to(device)
+    # resolve out_dir
+    if out_dir is None:
+        out_dir = model_name
+    if isinstance(out_dir, str) and os.path.isabs(out_dir):
+        results_dir = out_dir
     else:
-        # Unknown type: default to UNet for now, but warn
-        print(f"[warn] unknown model type '{model_type}', defaulting to UNet")
-        model = UNet(num_channels=num_channels).to(device)
+        results_dir = os.path.join(os.getcwd(), 'output', str(out_dir))
+    os.makedirs(results_dir, exist_ok=True)
 
-    checkpoint = torch.load(model_path, map_location=device)
-    state = checkpoint.get('model_state_dict', checkpoint)
-    model.load_state_dict(state)
-    model.eval()
+    model = load_model(model_dir, model_name, model_type, num_channels=num_channels, device=device)
 
-    # Compose PIL-based transform to ensure tensors are floats in [0,1]
-    if res and isinstance(res, (list, tuple)) and len(res) == 2:
-        h, w = int(res[0]), int(res[1])
-    else:
-        # default
-        h, w = 384, 576
-
-    pil_transform = T.Compose([
-        T.Resize((h, w)),
-        T.ToTensor(),
-    ])
-
-    # No preprocessing is applied here — use raw model outputs (grayscale masks)
-
-    outputs_saved = []
-
-    with torch.no_grad():
-        # Process in batches
-        for start in range(0, len(image_paths), batch_size):
-            batch_paths = image_paths[start : start + batch_size]
-            tensors = []
-            valid_paths = []
-
-            # Load and preprocess each image in the batch using PIL + ToTensor
-            for img_path in batch_paths:
-                try:
-                    # PIL open + convert ensures we have an RGB image
-                    pil_img = Image.open(img_path).convert("RGB")
-                    tensor = pil_transform(pil_img)  # C,H,W float32 in [0,1]
-
-                except Exception as e:
-                    print(f"Skipping {img_path}: failed to open with PIL ({e})")
-                    continue
-                tensors.append(tensor)
-                valid_paths.append(img_path)
-
-            if len(tensors) == 0:
+    # build transforms
+    size = tuple(map(int, res)) if res else None
+    def read_and_stack(paths: List[str]):
+        tensors = []
+        valid_paths = []
+        for p in paths:
+            try:
+                t = read_image(p, size=size) # type: ignore
+                tensors.append(t)
+                valid_paths.append(p)
+            except Exception:
+                # skip unreadable file
                 continue
+        if not tensors:
+            return torch.empty(0), []
+        batch = torch.stack(tensors, dim=0).to(device)
+        return batch, valid_paths
 
-            inp = torch.stack(tensors, dim=0).to(device)
-            # Debug: report shape of batch
-            try:
-                print(f"infer_images: batch input shape = {tuple(inp.shape)} (B,C,H,W)")
-            except Exception:
-                pass
+    outputs_written: List[str] = []
 
-            # run forward with features
-            outputs, d4_feats = model(inp, return_features=True)
-            # Debug: output shapes
+    for i in range(0, len(image_paths), batch_size):
+        batch_paths = image_paths[i:i+batch_size]
+        batch, valid_paths = read_and_stack(batch_paths)
+        if batch.numel() == 0:
+            continue
+
+        outputs, features = process_batch(model, batch, model_type, threshold=threshold)
+
+        # each output item -> save
+        for j in range(outputs.shape[0]):
+            out_single = outputs[j].cpu()
+            original_path = valid_paths[j]
+
+            # build save path preserving uploads structure if possible
+            base = os.path.splitext(os.path.basename(original_path))[0]
+            uploads_root = os.path.join(os.getcwd(), 'uploads')
             try:
-                print(f"infer_images: model outputs shape = {tuple(outputs.shape)} (B,1,H,W) - d4_feats shape = {tuple(d4_feats.shape) if d4_feats is not None else 'None'}")
+                common = os.path.commonpath([os.path.abspath(original_path), uploads_root])
             except Exception:
-                pass
-            # For segmentation models ensure probabilities are in [0,1]
+                common = ''
+            if common == os.path.abspath(uploads_root):
+                rel = os.path.relpath(original_path, start=uploads_root)
+                rel_dir = os.path.dirname(rel)
+                save_dir = os.path.join(results_dir, rel_dir)
+            else:
+                save_dir = results_dir
+            os.makedirs(save_dir, exist_ok=True)
+
+            out_file = os.path.join(save_dir, f"{base}_mask.png" if model_type == 'segmentation' else f"{base}.png")
+
             if model_type == 'segmentation':
-                outputs = torch.sigmoid(outputs)
-            # outputs now shape could be [B,1,H,W] for segmentation or [B,C,H,W] for recon
-            for i in range(outputs.shape[0]):
-                out_single = outputs[i]
-                print(out_single)
-                
-                img_path = valid_paths[i]
-
-                base_name = os.path.splitext(os.path.basename(img_path))[0]
-                # Prefer to preserve relative folder structure under 'uploads' when saving masks
-                uploads_root = os.path.join(os.getcwd(), 'uploads')
-                if os.path.commonpath([os.path.abspath(img_path), uploads_root]) == os.path.abspath(uploads_root):
-                    rel = os.path.relpath(img_path, start=uploads_root)
-                    rel_dir = os.path.dirname(rel)
-                    dest_dir = os.path.join(results_dir, rel_dir)
-                    os.makedirs(dest_dir, exist_ok=True)
-                    mask_save_path = os.path.join(dest_dir, f"{base_name}_mask.png")
-                else:
-                    mask_save_path = os.path.join(results_dir, f"{base_name}_mask.png")
-
-                # Handle per-model saving depending on model_type and output shape
-                if model_type == 'segmentation':
-                    # out_single expected shape [1,H,W] or [H,W]
-                    mask_tensor = out_single.squeeze()
-                    mask = mask_tensor.cpu().numpy()
-                else:
-                    # autoencoder or other: treat outputs as reconstructed images
-                    # out_single shape [C,H,W]
-                    out_np = out_single.cpu().numpy()
-                    # if C==1 produce single-channel grayscale, if C==3 produce RGB
-                    if out_np.ndim == 3:
-                        img_np = np.transpose(out_np, (1, 2, 0))  # H,W,C
-                        # clamp to [0,1]
-                        img_np = np.clip(img_np, 0, 1)
-                        # save as color image
-                        try:
-                            plt.imsave(mask_save_path, img_np)
-                        except Exception:
-                            cv2.imwrite(mask_save_path, (img_np * 255).astype('uint8'))
-                        outputs_saved.append(os.path.abspath(mask_save_path))
-                        print(f"Saved recon for {base_name} -> {mask_save_path}")
-                        continue
+                # Save raw model output (probabilities) as a grayscale image (one file per input)
+                mask = out_single.squeeze().cpu().numpy()
+                save_image(mask, out_file)
+                outputs_written.append(os.path.abspath(out_file))
+            else:
+                # reconstructions: assume C,H,W
+                arr = out_single.cpu().numpy()
+                # Autoencoder reconstructions: normalize to single-channel grayscale
+                if arr.ndim == 3:
+                    # assume (C,H,W) or (H,W,C)
+                    if arr.shape[0] <= 4 and arr.shape[0] != arr.shape[1]:
+                        img_np = arr.squeeze(0) if arr.shape[0] == 1 else np.transpose(arr, (1, 2, 0))
                     else:
-                        # fall back
-                        mask = out_single.squeeze().cpu().numpy()
-
-                # Save raw grayscale mask (0/255) using matplotlib to ensure consistent display
-                try:
-                    # mask is 0/1 bool or probability array — convert to 0-255 uint8
-                    mask_uint8 = (mask * 255).astype('uint8') if mask.dtype != np.uint8 else mask
-                    plt.imsave(mask_save_path, mask, cmap='gray')
-                except Exception:
-                    # fallback to cv2 if matplotlib save fails
-                    cv2.imwrite(mask_save_path, (mask * 255).astype('uint8'))
-
-                outputs_saved.append(os.path.abspath(mask_save_path))
-
-                # optionally save features
-                if save_features:
-                    feat_dir = os.path.join(results_dir, f"{base_name}_d4_layer")
-                    os.makedirs(feat_dir, exist_ok=True)
-                    # d4_feats shape [B, C, H, W]
-                    d4_np = d4_feats[i].cpu().numpy()
-                    for ch in range(d4_np.shape[0]):
-                        feat_map = d4_np[ch]
-                        feat_map = (feat_map - feat_map.min()) / (feat_map.max() - feat_map.min() + 1e-8)
-                        feat_map = (feat_map * 255).astype('uint8')
-                        feat_out = os.path.join(feat_dir, f"channel_{ch}.png")
-                        cv2.imwrite(feat_out, feat_map)
-                    print(f"Saved features for {base_name} -> {feat_dir}")
-
-                print(f"Saved mask for {base_name} -> {mask_save_path}")
-
-    return outputs_saved
-
-def save_predictions(model, dataloader, device, results_dir):
-    """
-    Save reconstructed outputs from the autoencoder.
-    """
-    os.makedirs(results_dir, exist_ok=True)
-    model.eval()
-
-    with torch.no_grad():
-        for imgs, _, names in dataloader:
-            imgs = imgs.to(device)
-            outputs, _ = model(imgs, return_features=True)  # forward pass
-
-            # Move to CPU
-            outputs = outputs.cpu()
-
-            for i in range(outputs.size(0)):
-                out_img = outputs[i].squeeze(0).numpy()  # shape [H, W]
-                out_img = (out_img * 255).astype("uint8")
-
-                img_name = names[i] if isinstance(names[i], str) else f"img_{i}.png"
-                save_path = os.path.join(results_dir, f"{os.path.splitext(img_name)[0]}_recon.png")
-                cv2.imwrite(save_path, out_img)
-
-def save_intermediate_channels(d4_feats, names, results_dir):
-    """
-    Save intermediate feature maps from the autoencoder.
-    Expects d4_feats shape: [B, C, H, W]
-    """
-    d4_np = d4_feats.cpu().numpy()
-
-    for i in range(d4_np.shape[0]):
-        img_name = names[i] if isinstance(names[i], str) else f"img_{i}"
-        feature_dir = os.path.join(results_dir, f"{img_name}_d4_layer")
-        os.makedirs(feature_dir, exist_ok=True)
-
-        for ch in range(d4_np.shape[1]):  # iterate channels
-            feat_map = d4_np[i, ch]
-
-            # Normalize each channel separately to [0,255]
-            feat_map = (feat_map - feat_map.min()) / (feat_map.max() - feat_map.min() + 1e-8)
-            feat_map = (feat_map * 255).astype("uint8")
-
-            save_path = os.path.join(feature_dir, f"channel_{ch}.png")
-            cv2.imwrite(save_path, feat_map)
-
-def eval_autoEncoder(model_name, num_channels = [64, 128, 256, 512, 1024, 512, 256, 128, 64], dataset_path = "Data_source/Augmented/Data", out_dir = None, test_dataset = True, shuffle = True, rgb = False):
-    # --- Config ---
-    set_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    batch_size = 4
-    model_dir = f'models/{model_name}'
-    model_path = f'{model_dir}/{model_name}.pth'
-    dataset_path = dataset_path
-    if out_dir is None:
-        out_dir = model_name
-    results_dir = f"output/{out_dir}"
-
-    if(not os.path.exists(results_dir) and rgb is not None):
-        os.makedirs(results_dir)
-
-    if(not os.path.exists(model_dir)):
-        os.makedirs(model_dir)
-        
-    # --- Load test data ---
-    if(test_dataset is True):
-        _, test_loader = load_idrid_grayscale_aug(dataset_path, batch_size=batch_size, shuffle=shuffle)
-    elif (test_dataset is False):
-       test_loader, _ = load_idrid_grayscale_aug(dataset_path, batch_size=batch_size, shuffle=shuffle)
-    else:
-        test_loader = load_idrid_grayscale_aug(dataset_path, batch_size=batch_size, shuffle=shuffle)
-
-    # --- Load model ---
-    model = AutoEncoder(num_channels=num_channels).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device)['model_state_dict'])
-    model.eval()
-
-    # --- Define loss function ---
-    criterion = nn.MSELoss()
-
-    # --- Evaluate ---
-    total_loss = 0.0
-
-    with torch.no_grad():
-        start_time = timer()
-        for imgs, masks, names in tqdm(test_loader):
-            imgs = imgs.to(device)
-            masks = masks.to(device)
-            outputs, d4_feats = model(imgs, return_features = True)
-
-            loss = criterion(outputs, masks)
-            total_loss += loss.item()
-            
-            # --- Save predictions ---
-            save_predictions(model, [(imgs.cpu(), masks.cpu(), names)], device, os.path.join(results_dir, "recons"))
-
-            # --- Save intermediate channels ---
-            save_intermediate_channels(d4_feats, names, os.path.join(results_dir, "features"))
-
-            
-            
-            
-    avg_loss = total_loss / len(test_loader)
-
-    print(f"\n🔍 Test Loss (MSE): {avg_loss:.6f}")
-    #print(f"\n🔍 Test Accuracy : {avg_acc:.6f}")
-
-    # --- visualize_reconstructions (8 recontstructions) ---
-    visualize_reconstructions(model, test_loader, device, results_dir, avg_loss)
-
-def eval_RFMiD(model_name, num_channels = [64, 128, 256, 512, 1024, 512, 256, 128, 64], dataset_path = "Data_source/RFMiD", out_dir = None, test_dataset = True, shuffle = True, rgb = False):
-    # --- Config ---
-    set_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    batch_size = 4
-    model_dir = f'models/{model_name}'
-    model_path = f'{model_dir}/{model_name}.pth'
-    dataset_path = dataset_path
-    if out_dir is None:
-        out_dir = model_name
-    results_dir = f"output/{out_dir}"
-
-    if(not os.path.exists(results_dir) and rgb is not None):
-        os.makedirs(results_dir)
-
-    if(not os.path.exists(model_dir)):
-        os.makedirs(model_dir)
-        
-    # --- Load test data ---
-    test_loader = load_rfmid(dataset_path, batch_size=batch_size, shuffle=shuffle)
-
-    # --- Load model ---
-    model = AutoEncoder(num_channels=num_channels).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device)['model_state_dict'])
-    model.eval()
-
-    # --- Define loss function ---
-    criterion = nn.MSELoss()
-
-    # --- Evaluate ---
-    total_loss = 0.0
-
-    with torch.no_grad():
-        start_time = timer()
-        for imgs, masks, names in tqdm(test_loader):
-            imgs = imgs.to(device)
-            masks = masks.to(device)
-            outputs = model(imgs)
-
-            loss = criterion(outputs, masks)
-            total_loss += loss.item()
-            
-            # --- Save predictions ---
-            #save_predictions(model, [(imgs.cpu(), masks.cpu(), names)], device, os.path.join(results_dir, "recons"))
-
-            # --- Save intermediate channels ---
-            #save_intermediate_channels(d4_feats, names, os.path.join(results_dir, "features"))
-
-            
-            
-            
-    avg_loss = total_loss / len(test_loader)
-
-    print(f"\n🔍 Test Loss (MSE): {avg_loss:.6f}")
-    #print(f"\n🔍 Test Accuracy : {avg_acc:.6f}")
-
-    # --- visualize_reconstructions (8 recontstructions) ---
-    visualize_reconstructions(model, test_loader, device, results_dir, avg_loss)
-
-def eval_RFMiD_color(model_name, num_channels = [64, 128, 256, 512, 1024, 512, 256, 128, 64], dataset_path = "Data_source/RFMiD", out_dir = None, test_dataset = True, shuffle = True, rgb = False):
-    # --- Config ---
-    set_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    batch_size = 32
-    model_dir = f'models/AE2/{model_name}'
-    model_path = f'{model_dir}/{model_name}.pth'
-    dataset_path = dataset_path
-    if out_dir is None:
-        out_dir = model_name
-    results_dir = f"output/{out_dir}"
-
-    if(not os.path.exists(results_dir) and rgb is not None):
-        os.makedirs(results_dir)
-
-    if(not os.path.exists(model_dir)):
-        os.makedirs(model_dir)
-        
-    # --- Load test data ---
-    test_loader = load_rfmid_color(dataset_path, batch_size=batch_size, shuffle=shuffle)
-
-    # --- Load model ---
-    model = AutoEncoder_RFMiD(num_channels=num_channels).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device)['model_state_dict'])
-    model.eval()
-
-    # --- Define loss function ---
-    criterion = nn.MSELoss()
-
-    # --- Evaluate ---
-    total_loss = 0.0
-    with torch.no_grad():
-        start_time = timer()
-        for imgs, masks, names in tqdm(test_loader):
-            imgs = imgs.to(device)
-            masks = masks.to(device)
-            outputs = model(imgs)
-
-            loss = criterion(outputs, masks)
-            total_loss += loss.item()
-
-
-            
-            # --- Save predictions ---
-            #save_predictions(model, [(imgs.cpu(), masks.cpu(), names)], device, os.path.join(results_dir, "recons"))
-
-            # --- Save intermediate channels ---
-            #save_intermediate_channels(d4_feats, names, os.path.join(results_dir, "features"))
-
-            
-            
-            
-    avg_loss = total_loss / len(test_loader)
-
-    print(f"\n🔍 Test Loss (MSE): {avg_loss:.6f}")
-    #print(f"\n🔍 Test Accuracy : {avg_acc:.6f}")
-
-    # --- visualize_reconstructions (8 recontstructions) ---
-    visualize_reconstructions_color(model, test_loader, device, results_dir, avg_loss)
-
-def eval_RFMiD_color_2(
-    model_name,
-    num_channels=[64, 128, 256, 512, 1024, 512, 256, 128, 64],
-    dataset_path="Data_source/RFMiD_color",
-    out_dir=None,
-    test_dataset=True,
-    shuffle=True,
-    rgb=False
-):
-    set_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    batch_size = 32
-    model_dir = f"models/AE3/{model_name}"
-    model_path = f"{model_dir}/{model_name}.pth"
-
-    if out_dir is None:
-        out_dir = model_name
-    results_dir = f"output/{out_dir}"
-
-    os.makedirs(results_dir, exist_ok=True)
-    os.makedirs(model_dir, exist_ok=True)
-
-    # --- Load data ---
-    test_loader = load_rfmid_color(dataset_path, batch_size=batch_size, shuffle=shuffle)
-
-    # --- Load model ---
-    model = AutoEncoder_RFMiD(num_channels=num_channels).to(device)
-    checkpoint = torch.load(model_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-
-    # --- Define losses/metrics ---
-    criterion = nn.MSELoss(reduction="mean")
-    lpips_loss_fn = lpips.LPIPS(net="vgg").to(device)
-
-    total_mse, total_psnr, total_ssim, total_lpips = 0.0, 0.0, 0.0, 0.0
-    n_batches = len(test_loader)
-
-    with torch.no_grad():
-        start_time = timer()
-        for imgs, masks, names in tqdm(test_loader, desc="Evaluating"):
-            imgs = imgs.to(device)
-            masks = masks.to(device)
-            outputs = model(imgs)
-
-            # --- Ensure range [0, 1] ---
-            outputs = torch.clamp(outputs, 0, 1)
-            masks = torch.clamp(masks, 0, 1)
-
-            # --- Compute metrics ---
-            mse_loss = criterion(outputs, masks)
-            psnr_val = psnr(outputs, masks)
-            ssim_val = ssim(outputs, masks)
-            lpips_val = lpips_loss_fn(outputs, masks).mean()  # LPIPS is a distance (lower is better)
-
-            total_mse += mse_loss.item()
-            total_psnr += float(psnr_val)
-            total_ssim += float(ssim_val)
-            total_lpips += lpips_val.item()
-
-    # --- Averages ---
-    avg_mse = total_mse / n_batches
-    avg_psnr = total_psnr / n_batches
-    avg_ssim = total_ssim / n_batches
-    avg_lpips = total_lpips / n_batches
-
-    print("\n🔍 Evaluation Results:")
-    print(f"   MSE Loss      : {avg_mse:.6f}")
-    print(f"   PSNR (dB)     : {avg_psnr:.4f}")
-    print(f"   SSIM          : {avg_ssim:.4f}")
-    print(f"   LPIPS (↓)     : {avg_lpips:.4f}")
-    print(f"   Similarity ≈  {avg_ssim * 100:.2f}%")
-
-    print(f"⏱️  Evaluation completed in {(timer() - start_time):.2f} seconds.")
-    # --- visualize_reconstructions (8 recontstructions) ---
-    evaluation_result = f"MSE: {avg_mse:.6f} || PSNR: {avg_psnr:.4f} || SSIM: {avg_ssim:.4f} || LPIPS (↓): {avg_lpips:.4f}"
-    visualize_reconstructions_color(model, test_loader, device, results_dir, evaluation_result)
-
-
-def eval_flower102_color(model_name, num_channels = [64, 128, 256, 512, 1024, 512, 256, 128, 64], out_dir = None, rgb = False):
-    # --- Config ---
-    set_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    batch_size = 4
-    model_dir = f'models/{model_name}'
-    model_path = f'{model_dir}/{model_name}.pth'
-    if out_dir is None:
-        out_dir = model_name
-    results_dir = f"output/{out_dir}"
-
-    if(not os.path.exists(results_dir) and rgb is not None):
-        os.makedirs(results_dir)
-
-    if(not os.path.exists(model_dir)):
-        os.makedirs(model_dir)
-        
-    # --- Load test data ---
-    test_loader = load_flowers102(batch_size=batch_size)
-
-    # --- Load model ---
-    model = AutoEncoder(num_channels=num_channels).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device)['model_state_dict'])
-    model.eval()
-
-    # --- Define loss function ---
-    criterion = nn.MSELoss()
-
-    # --- Evaluate ---
-    total_loss = 0.0
-    with torch.no_grad():
-        start_time = timer()
-        for imgs, _ in tqdm(test_loader):
-            imgs = imgs.to(device)
-            outputs = model(imgs)
-
-            loss = criterion(outputs, imgs)
-            total_loss += loss.item()
-            
-            # --- Save predictions ---
-            #save_predictions(model, [(imgs.cpu(), masks.cpu(), names)], device, os.path.join(results_dir, "recons"))
-
-            # --- Save intermediate channels ---
-            #save_intermediate_channels(d4_feats, names, os.path.join(results_dir, "features"))
-
-            
-            
-            
-    avg_loss = total_loss / len(test_loader)
-
-    print(f"\n🔍 Test Loss (MSE): {avg_loss:.6f}")
-    #print(f"\n🔍 Test Accuracy : {avg_acc:.6f}")
-
-    # --- visualize_reconstructions (8 recontstructions) ---
-    visualize_reconstructions_flower102(model, test_loader, device, results_dir, avg_loss)
-
-
-""" def eval_vae(num_samples = 16):
-    output_visualizations_directory = "results_VAE"
-    set_seed(42)
-    if not os.path.exists(output_visualizations_directory):
-        os.makedirs(output_visualizations_directory)
-
-    # --- Config ---
-    model_path = 'models/VAE/vae_e6_d6_w192_h128_rfmid_sk[d6]_color_latent_conv_beta[0]/vae_e6_d6_w192_h128_rfmid_sk[d6]_color_latent_conv_beta[0].pth'
-
-    # --- Load model ---
-    model = LadderVAE()
-    model.load_state_dict(torch.load(model_path)['model_state_dict'])
-    model.eval()
-
-    samples = model.sample(num_samples).cpu()
-    fig, axes = plt.subplots(4, 4, figsize=(6, 6))
-    for i, ax in enumerate(axes.flatten()):
-        img = samples[i].permute(1, 2, 0).cpu().numpy()
-        ax.imshow(img)
-        ax.axis('off')
-    plt.tight_layout()
-    plt.savefig(f'{output_visualizations_directory}/vae_3_alpha_1_seeded(42).png')
-    plt.show() """
+                        img_np = np.transpose(arr, (1, 2, 0))
+                else:
+                    img_np = arr
+                # If multi-channel, convert to grayscale inside save_image
+                save_image(img_np, out_file)
+                outputs_written.append(os.path.abspath(out_file))
+
+            # features
+            if save_features and features is not None:
+                feat = features[j].cpu().numpy()
+                feat_dir = os.path.join(save_dir, f"{base}_d4_layer")
+                os.makedirs(feat_dir, exist_ok=True)
+                for ch in range(feat.shape[0]):
+                    fmap = feat[ch]
+                    fmap = (fmap - fmap.min()) / (fmap.max() - fmap.min() + 1e-8)
+                    fmap = (fmap * 255).astype('uint8')
+                    save_image(fmap, os.path.join(feat_dir, f"channel_{ch}.png"))
+
+    return outputs_written

@@ -1,7 +1,11 @@
 import io
 import os
+import sys
 import json
 from urllib.parse import urlparse
+
+# Ensure backend package root is importable when pytest is invoked from repo root
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app import app
 
@@ -59,22 +63,23 @@ def test_generate_endpoint(tmp_path):
     from urllib.parse import urlparse
 
     # verify generated masks are reachable and match expected resolution
+    # Expect one generated file per uploaded image
+    assert isinstance(body['generated'], list)
+    assert len(body['generated']) == 2, f"Expected 2 generated files, got {len(body['generated'])}"
+
     for url in body['generated']:
         parsed = urlparse(url)
-        # path should point to /output/<file>
         assert parsed.path.startswith('/output/')
-
-        # fetch via Flask test client
         resp = client.get(parsed.path)
         assert resp.status_code == 200
 
-        # open image bytes and validate content
         img = Image.open(io.BytesIO(resp.data)).convert('L')
         arr = np.array(img)
         assert arr.size > 0
-        # expect segmentation default resolution 384x576 (H x W)
         assert arr.shape[0] == 384 and arr.shape[1] == 576, f"Unexpected mask shape: {arr.shape}"
-        # no further checks — model may produce trivial masks depending on training
+        # ensure the saved mask is not a uniform image
+        uniques = np.unique(arr)
+        assert uniques.size > 1, "Saved mask appears uniform (likely incorrect)"
 
 
 def test_save_outputs_endpoint(tmp_path):

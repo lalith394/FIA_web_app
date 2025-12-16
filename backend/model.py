@@ -215,7 +215,7 @@ class AutoEncoder_RFMiD(nn.Module):
     
     def forward(self, x):
         #                                [1, 64, 128, 288]
-        _, p1 = self.e1(x)             #[2, 64, 192, 288]
+        s1, p1 = self.e1(x)             #[2, 64, 192, 288]
         _, p2 = self.e2(p1)             #[2, 128, 96, 144]
         _, p3 = self.e3(p2)             #[2, 256, 48, 72]
         _, p4 = self.e4(p3)             #[2, 512, 24, 36] 
@@ -227,7 +227,7 @@ class AutoEncoder_RFMiD(nn.Module):
         d3 = self.d3(d2, None)  #[2, 512, 48, 72]
         d4 = self.d4(d3, None)   #[2, 256, 96, 144]
         d5 = self.d5(d4, None)   #[2, 128, 192, 288]
-        d6 = self.d6(d5, None)   #[2, 64, 384, 576]
+        d6 = self.d6(d5, s1)   #[2, 64, 384, 576]
         out = self.out(d6)           #[2, 1, 384, 576]
         return out
 
