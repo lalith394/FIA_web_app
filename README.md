@@ -48,6 +48,8 @@ pip install -r requirements.txt
 ```bash
 cd backend
 python app.py
+#or
+flask --app app.py run
 ```
 
 The backend exposes endpoints like `/api/generate` and serves artifacts under `/output/<path>`.
