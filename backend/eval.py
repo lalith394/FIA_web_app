@@ -26,11 +26,12 @@ from typing import List, Optional, Tuple
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
+import cv2
 
 import torch
 from torchvision import transforms as T
 
-from model import UNet, AutoEncoder, AutoEncoder_RFMiD
+from model import UNet, AutoEncoder_RFMiD
 
 
 def find_model_metadata(models_root: str, model_name: str) -> Tuple[str, str, dict]:
@@ -162,6 +163,36 @@ def save_image(arr: np.ndarray, path: str, binary: bool = False, threshold: floa
     plt.imsave(path, img, cmap='gray', vmin=0.0, vmax=1.0)
 
 
+def save_color_output(arr: np.ndarray, path: str) -> None:
+    """Save an RGB image (either C,H,W or H,W,C or H,W) to disk using matplotlib.
+
+    - Accepts floats in [0,1] or integer arrays 0..255.
+    - If input is single-channel, converts to RGB by replicating channels.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    img = np.asarray(arr)
+
+    # If CHW convert to HWC
+    if img.ndim == 3 and img.shape[0] <= 4 and img.shape[0] != img.shape[2]:
+        img = np.transpose(img, (1, 2, 0))
+
+    if img.ndim == 2:
+        # single channel -> replicate to RGB
+        img = np.stack([img, img, img], axis=-1)
+
+    # Normalize to float in [0,1]
+    if img.dtype in [np.uint8, np.int32, np.int64]:
+        img = img.astype(np.float32) / 255.0
+    else:
+        img = img.astype(np.float32)
+        if img.max() > 1.0:
+            img = img / 255.0
+
+    # Clip and save
+    img = np.clip(img, 0.0, 1.0)
+    plt.imsave(path, img, vmin=0.0, vmax=1.0)
+
+
 def process_batch(model: torch.nn.Module, batch: torch.Tensor, model_type: str, threshold: float = 0.5) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run a model forward and return processed outputs and optional features.
 
@@ -215,6 +246,15 @@ def infer_images(model_name: str, image_paths: List[str], threshold: float = 0.5
         else:
             num_channels = v
 
+    # number of channels produced by model output (1 or 3)
+    num_channels_out = None
+    if 'num_channels_out' in params:
+        v = params['num_channels_out']
+        if isinstance(v, dict):
+            num_channels_out = v.get('default')
+        else:
+            num_channels_out = v
+
     res = None
     if 'resolution' in params:
         v = params['resolution']
@@ -225,6 +265,10 @@ def infer_images(model_name: str, image_paths: List[str], threshold: float = 0.5
     # defaults
     if model_type == 'segmentation' and (not res or len(res) != 2):
         res = [384, 576]
+
+    # default for num_channels_out if not present: segmentation -> 1, autoencoder -> 1 (unless specified)
+    if num_channels_out is None:
+        num_channels_out = 1 if model_type == 'segmentation' else 1
 
     # resolve out_dir
     if out_dir is None:
@@ -288,9 +332,14 @@ def infer_images(model_name: str, image_paths: List[str], threshold: float = 0.5
             out_file = os.path.join(save_dir, f"{base}_mask.png" if model_type == 'segmentation' else f"{base}.png")
 
             if model_type == 'segmentation':
-                # Save raw model output (probabilities) as a grayscale image (one file per input)
+                # Save model output depending on desired output channels
                 mask = out_single.squeeze().cpu().numpy()
-                save_image(mask, out_file)
+                if int(num_channels_out) == 3:
+                    # produce a color image
+                    save_color_output(mask, out_file)
+                else:
+                    # produce a grayscale image (raw probabilities, no thresholding by default)
+                    save_image(mask, out_file)
                 outputs_written.append(os.path.abspath(out_file))
             else:
                 # reconstructions: assume C,H,W
@@ -316,7 +365,37 @@ def infer_images(model_name: str, image_paths: List[str], threshold: float = 0.5
                 for ch in range(feat.shape[0]):
                     fmap = feat[ch]
                     fmap = (fmap - fmap.min()) / (fmap.max() - fmap.min() + 1e-8)
-                    fmap = (fmap * 255).astype('uint8')
-                    save_image(fmap, os.path.join(feat_dir, f"channel_{ch}.png"))
+                    # leave as float in [0,1] and let save_image handle conversion
+                    save_image(fmap.astype(np.float32), os.path.join(feat_dir, f"channel_{ch}.png"))
 
     return outputs_written
+
+
+def save_predictions(model, dataloader, device, results_dir):
+    """
+    Save reconstructed outputs from the autoencoder or segmentation model.
+    """
+    os.makedirs(results_dir, exist_ok=True)
+    model.eval()
+
+    with torch.no_grad():
+        for imgs, _, names in dataloader:
+            imgs = imgs.to(device)
+            outputs, _ = model(imgs, return_features=True)  # forward pass
+
+            # Move to CPU
+            outputs = outputs.cpu()
+
+            for i in range(outputs.size(0)):
+                out_img = outputs[i].squeeze(0).numpy()  # shape [H, W] or [H, W, C]
+                out_img = (out_img * 255).astype("uint8")
+
+                img_name = names[i] if isinstance(names[i], str) else f"img_{i}.png"
+                save_path = os.path.join(results_dir, f"{os.path.splitext(img_name)[0]}_recon.png")
+
+                # Check metadata for output channels
+                if outputs.size(1) == 3:  # Color image
+                    out_img = np.transpose(out_img, (1, 2, 0))  # Convert to HWC
+                    cv2.imwrite(save_path, cv2.cvtColor(out_img, cv2.COLOR_RGB2BGR))
+                else:  # Grayscale image
+                    cv2.imwrite(save_path, out_img)
