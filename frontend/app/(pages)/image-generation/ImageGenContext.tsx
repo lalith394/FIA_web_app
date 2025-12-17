@@ -38,30 +38,21 @@ export interface ImageGenState {
 
 const defaultState: ImageGenState = {
   images: [],
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
   setImages: () => {},
   singleImage: null,
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
   setSingleImage: () => {},
   model: null,
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
   setModel: () => {},
   outputDir: `/outputs/${new Date().toISOString().slice(0, 10)}/`,
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
   setOutputDir: () => {},
   config: { threshold: 0.5, batchSize: 1, saveFeatures: false },
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
   setConfig: () => {},
   generatedOutputs: [],
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
   setGeneratedOutputs: () => {},
   loading: false,
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
   setLoading: () => {},
   progressPercent: 0,
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
   setProgressPercent: () => {},
-  // eslint-disable-next-line @typescript-eslint/no-empty-function
   reset: () => {},
 };
 

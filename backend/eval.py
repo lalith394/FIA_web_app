@@ -342,19 +342,31 @@ def infer_images(model_name: str, image_paths: List[str], threshold: float = 0.5
                     save_image(mask, out_file)
                 outputs_written.append(os.path.abspath(out_file))
             else:
-                # reconstructions: assume C,H,W
-                arr = out_single.cpu().numpy()
-                # Autoencoder reconstructions: normalize to single-channel grayscale
-                if arr.ndim == 3:
-                    # assume (C,H,W) or (H,W,C)
-                    if arr.shape[0] <= 4 and arr.shape[0] != arr.shape[1]:
-                        img_np = arr.squeeze(0) if arr.shape[0] == 1 else np.transpose(arr, (1, 2, 0))
-                    else:
-                        img_np = np.transpose(arr, (1, 2, 0))
+                # reconstructions: preserve color if present, ensure values in [0,1]
+                out_np = out_single.numpy()
+
+                # If outputs look like logits, apply sigmoid
+                if out_np.min() < 0.0 or out_np.max() > 1.0:
+                    out_single = torch.sigmoid(out_single)
+                    out_np = out_single.numpy()
+
+                # If CHW -> HWC
+                if out_np.ndim == 3 and out_np.shape[0] <= 4 and out_np.shape[0] != out_np.shape[2]:
+                    img_np = np.transpose(out_np, (1, 2, 0))
                 else:
-                    img_np = arr
-                # If multi-channel, convert to grayscale inside save_image
-                save_image(img_np, out_file)
+                    img_np = out_np
+
+                # Normalize floats to [0,1]
+                if np.issubdtype(img_np.dtype, np.floating):
+                    if img_np.max() > 1.0:
+                        img_np = img_np / 255.0
+                    img_np = np.clip(img_np, 0.0, 1.0)
+
+                # Save preserving color when available
+                if img_np.ndim == 3 and img_np.shape[2] == 3:
+                    save_color_output(img_np, out_file)
+                else:
+                    save_image(img_np, out_file)
                 outputs_written.append(os.path.abspath(out_file))
 
             # features
@@ -387,15 +399,28 @@ def save_predictions(model, dataloader, device, results_dir):
             outputs = outputs.cpu()
 
             for i in range(outputs.size(0)):
-                out_img = outputs[i].squeeze(0).numpy()  # shape [H, W] or [H, W, C]
-                out_img = (out_img * 255).astype("uint8")
+                out_np = outputs[i].numpy()  # (C,H,W) or (H,W)
+
+                # If CHW -> HWC
+                if out_np.ndim == 3 and out_np.shape[0] <= 4 and out_np.shape[0] != out_np.shape[2]:
+                    out_np = np.transpose(out_np, (1, 2, 0))
+
+                # Normalize floats to 0..255 uint8
+                if np.issubdtype(out_np.dtype, np.floating):
+                    out_np = np.clip(out_np, 0.0, 1.0)
+                    out_img = (out_np * 255).astype("uint8")
+                else:
+                    out_img = out_np.astype("uint8")
 
                 img_name = names[i] if isinstance(names[i], str) else f"img_{i}.png"
                 save_path = os.path.join(results_dir, f"{os.path.splitext(img_name)[0]}_recon.png")
 
-                # Check metadata for output channels
-                if outputs.size(1) == 3:  # Color image
-                    out_img = np.transpose(out_img, (1, 2, 0))  # Convert to HWC
+                # Write color vs grayscale
+                if out_img.ndim == 3 and out_img.shape[2] == 3:
                     cv2.imwrite(save_path, cv2.cvtColor(out_img, cv2.COLOR_RGB2BGR))
-                else:  # Grayscale image
+                else:
+                    # If multi-channel but not 3, collapse to grayscale
+                    if out_img.ndim == 3:
+                        out_img = out_img.mean(axis=2).astype("uint8")
+                    out_img = np.concatenate([out_img, out_img, out_img], axis=-1) *255
                     cv2.imwrite(save_path, out_img)
