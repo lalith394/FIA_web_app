@@ -1,4 +1,3 @@
-import NavigationBar from '@/app/components/navigation'
 import React from 'react'
 
 function page() {
